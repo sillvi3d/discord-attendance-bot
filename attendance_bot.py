@@ -165,7 +165,15 @@ def get_today_record(uid, name):
 
 
 async def get_log_channel(guild):
-    return discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    # 정확히 일치하는 채널 우선
+    ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if ch:
+        return ch
+    # 없으면 이름에 키워드가 '포함'된 채널 (이모지 붙은 채널명 지원: 👆출석체크 등)
+    for c in guild.text_channels:
+        if LOG_CHANNEL_NAME in c.name:
+            return c
+    return None
 
 
 def is_target_channel(channel):
