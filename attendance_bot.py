@@ -36,7 +36,7 @@ load_dotenv()
 # 토큰은 같은 폴더의 .env 파일에서만 읽어옴 (코드/깃허브에 절대 넣지 않기)
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-LOG_CHANNEL_NAME = "기록"        # 스탬프/정산을 남길 텍스트 채널 이름
+LOG_CHANNEL_NAME = "출석체크"     # 스탬프/정산을 남길 텍스트 채널 이름
 BOT_NICKNAME = "Study Multi-Bot"       # 서버에서 표시될 봇 별명(한글·공백 가능). None이면 변경 안 함.
 
 # 감지할 음성채널 지정 — 둘 중 하나만 채우면 됩니다.
