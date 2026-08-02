@@ -43,8 +43,9 @@ BOT_NICKNAME = "Study Multi-Bot"       # 서버에서 표시될 봇 별명(한�
 #  (권장) 채널 ID로 지정: 이름이 같아도 정확히 구분됨.
 #         디스코드 설정 > 고급 > 개발자 모드 ON → 음성채널 우클릭 > "채널 ID 복사"
 VOICE_CHANNEL_IDS = []                        # 예: [123456789012345678, 987654321098765432]
-#  (대안) 이름으로 지정: ID를 비워두면 이 이름들을 감지.
-VOICE_CHANNEL_NAMES = ["공부방"]              # 두 채널 이름이 다르면 둘 다 넣기: ["공부방", "정모방"]
+#  (대안) 이름으로 지정: ID를 비워두면, 이름에 아래 키워드가 '포함'된 음성채널을 감지.
+#         예) ["공부방"] → 공부방, 공부방🔇, 🎧공부방 전부 잡힘 / 수요일 회의는 제외.
+VOICE_CHANNEL_NAMES = ["공부방"]
 
 TIMEZONE = pytz.timezone("Asia/Seoul")
 MIN_ATTENDANCE_MINUTES = 1     # 이 시간(분) 이상 누적해야 '출석 O' 인정. 0이면 잠깐이라도 들어오면 인정.
@@ -172,7 +173,8 @@ def is_target_channel(channel):
         return False
     if VOICE_CHANNEL_IDS:
         return channel.id in VOICE_CHANNEL_IDS
-    return channel.name in VOICE_CHANNEL_NAMES
+    # 이름에 키워드가 '포함'되면 감지 (이모지 붙은 방도 잡힘: 공부방🔇, 🎧공부방 등)
+    return any(keyword in channel.name for keyword in VOICE_CHANNEL_NAMES)
 
 
 # ==================== 이벤트 ====================
