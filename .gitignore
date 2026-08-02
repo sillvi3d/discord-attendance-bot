@@ -1,0 +1,6 @@
+# 비밀값 · 데이터 · 캐시는 깃허브에 올리지 않음
+.env
+attendance_data.json
+__pycache__/
+*.pyc
+venv/
