@@ -8,12 +8,17 @@ Discord 스터디 출석 / 타임랭킹 봇
 - 정모 참석 체크(✅ 이모지)
 
 명령어:
-  !주간 / !현황   이번 주(지난 수 17시~지금) 전체 타임랭킹 + 로그 첨부
-  !월간           이번 달(1일~지금) 전체 타임랭킹 + 로그 첨부
+  !주간 / !현황   이번 주 전체 타임랭킹 (랭킹만)
+  !월간           이번 달 전체 타임랭킹 (랭킹만)
+  !주간로그        이번 주 기록 Markdown 파일
+  !월간로그        이번 달 기록 Markdown 파일
+  !전체로그        전체 기록 Markdown 파일
   !오늘           내 오늘 세션 기록
-  !내주간 / !내순위  내 이번 주 누적/순위 (본인만)
+  !내주간         내 이번 주 기록만 (본인만)
+  !내순위         내 이번 주 순위 + 누적 (본인만)
   !정모현황       정모 참석 예정자
   (관리자) !정모체크 · !시간추가 @멤버 분
+※ 자동 발표(주간 수17시 / 월간 말일)에는 로그 파일이 함께 첨부됨.
 
 실행: pip install discord.py pytz python-dotenv
 """
@@ -167,7 +172,7 @@ def personal_sessions_today(uid):
 
 
 # ==================== 임베드/문서 ====================
-def build_ranking_embed(guild, title, start_dt, end_dt, color, include_attendance=False):
+def build_ranking_embed(guild, title, start_dt, end_dt, color):
     period = f"{start_dt.strftime('%Y.%m.%d %H:%M')} ~ {end_dt.strftime('%m.%d %H:%M')}"
     embed = discord.Embed(title=title, color=color)
     embed.set_footer(text=period)
@@ -187,17 +192,6 @@ def build_ranking_embed(guild, title, start_dt, end_dt, color, include_attendanc
     if rest:
         body += "\n-\n" + "\n".join(rest)
     embed.description = body
-    if include_attendance:
-        attended = {uid for uid, d in totals.items() if d["sec"] >= MIN_ATTENDANCE_MINUTES * 60}
-        present, absent = [], []
-        for m in guild.members:
-            if m.bot:
-                continue
-            (present if str(m.id) in attended else absent).append(m.display_name)
-        embed.add_field(name=f"✅ 참여 ({len(present)}명)",
-                        value=", ".join(present) if present else "없음", inline=False)
-        embed.add_field(name=f"❌ 미참여 ({len(absent)}명)",
-                        value=", ".join(absent) if absent else "없음", inline=False)
     meetup_att = meetup.get("attendees", {})
     if meetup_att:
         embed.add_field(name=f"📢 정모 참석 예정 ({len(meetup_att)}명)",
@@ -239,18 +233,52 @@ def markdown_log(title, start_dt, end_dt):
     return "\n".join(lines) + "\n"
 
 
-async def send_ranking(channel, guild, title, start_dt, end_dt, color, tag, include_attendance=False):
-    """랭킹 임베드 + Markdown 로그 파일 저장 & 첨부"""
-    embed = build_ranking_embed(guild, title, start_dt, end_dt, color, include_attendance)
-    md = markdown_log(title, start_dt, end_dt)
+def markdown_full():
+    """전체 기간 누적 랭킹 + 모든 세션 목록"""
+    lines = ["# 전체 스터디 로그",
+             f"생성: {now_kst().strftime('%Y-%m-%d %H:%M')}",
+             f"총 세션 수: {len(sessions_log)}", ""]
+    totals = {}
+    for s in sessions_log:
+        t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0})
+        t["sec"] += s["dur"]
+        t["name"] = s["name"]
+    lines += ["## 전체 누적 랭킹", "", "| 순위 | 이름 | 누적 시간 |", "|---|---|---|"]
+    for i, (uid, d) in enumerate(sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True), 1):
+        lines.append(f"| {i} | {d['name']} | {format_duration(d['sec'])} |")
+    lines += ["", "## 전체 세션 목록", "", "| 날짜 | 이름 | 입장 | 퇴장 | 시간 |", "|---|---|---|---|---|"]
+    for s in sorted(sessions_log, key=lambda x: x.get("end", "")):
+        try:
+            st = datetime.fromisoformat(s["start"])
+            en = datetime.fromisoformat(s["end"])
+        except (KeyError, ValueError):
+            continue
+        lines.append(f"| {en.strftime('%Y-%m-%d')} | {s['name']} | "
+                     f"{st.strftime('%H:%M:%S')} | {en.strftime('%H:%M:%S')} | {format_duration(s['dur'])} |")
+    return "\n".join(lines) + "\n"
+
+
+def build_log_file(md_text, tag, end_dt):
+    """Markdown을 logs/에 저장하고 discord.File 반환"""
     fname = f"{tag}_{end_dt.strftime('%Y-%m-%d')}.md"
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(os.path.join(LOG_DIR, fname), "w", encoding="utf-8") as f:
-            f.write(md)
+            f.write(md_text)
     except OSError:
         pass
-    file = discord.File(io.BytesIO(md.encode("utf-8")), filename=fname)
+    return discord.File(io.BytesIO(md_text.encode("utf-8")), filename=fname)
+
+
+async def send_ranking_embed(channel, guild, title, start_dt, end_dt, color):
+    """랭킹 임베드만 전송 (로그 파일 없음)"""
+    await channel.send(embed=build_ranking_embed(guild, title, start_dt, end_dt, color))
+
+
+async def send_ranking_with_log(channel, guild, title, start_dt, end_dt, color, tag):
+    """임베드 + 로그 파일 함께 (자동 발표용)"""
+    embed = build_ranking_embed(guild, title, start_dt, end_dt, color)
+    file = build_log_file(markdown_log(title, start_dt, end_dt), tag, end_dt)
     await channel.send(embed=embed, file=file)
 
 
@@ -321,8 +349,8 @@ async def weekly_report():
     for guild in bot.guilds:
         ch = await get_log_channel(guild)
         if ch:
-            await send_ranking(ch, guild, "🏆 Weekly 스터디 타임랭킹 🏆",
-                               start, now, COLOR_WEEKLY, "weekly", include_attendance=True)
+            await send_ranking_with_log(ch, guild, "🏆 Weekly 스터디 타임랭킹 🏆",
+                                        start, now, COLOR_WEEKLY, "weekly")
 
 
 @tasks.loop(minutes=1)
@@ -334,8 +362,8 @@ async def monthly_report():
     for guild in bot.guilds:
         ch = await get_log_channel(guild)
         if ch:
-            await send_ranking(ch, guild, "📅 Monthly 스터디 타임랭킹 📅",
-                               start, now, COLOR_MONTHLY, "monthly", include_attendance=True)
+            await send_ranking_with_log(ch, guild, "📅 Monthly 스터디 타임랭킹 📅",
+                                        start, now, COLOR_MONTHLY, "monthly")
 
 
 @weekly_report.before_loop
@@ -351,9 +379,9 @@ async def _b2():
 # ==================== 명령어 ====================
 @bot.command(name="주간")
 async def weekly_cmd(ctx):
-    """!주간 - 이번 주(지난 수17시~지금) 전체 타임랭킹 + 로그"""
-    await send_ranking(ctx.channel, ctx.guild, "🏆 Weekly 스터디 타임랭킹 🏆",
-                       get_week_start(), now_kst(), COLOR_WEEKLY, "weekly", include_attendance=True)
+    """!주간 - 이번 주 전체 타임랭킹 (랭킹만)"""
+    await send_ranking_embed(ctx.channel, ctx.guild, "🏆 Weekly 스터디 타임랭킹 🏆",
+                             get_week_start(), now_kst(), COLOR_WEEKLY)
 
 
 @bot.command(name="현황")
@@ -363,9 +391,32 @@ async def status_cmd(ctx):
 
 @bot.command(name="월간")
 async def monthly_cmd(ctx):
-    """!월간 - 이번 달(1일~지금) 전체 타임랭킹 + 로그"""
-    await send_ranking(ctx.channel, ctx.guild, "📅 Monthly 스터디 타임랭킹 📅",
-                       month_start(), now_kst(), COLOR_MONTHLY, "monthly", include_attendance=True)
+    """!월간 - 이번 달 전체 타임랭킹 (랭킹만)"""
+    await send_ranking_embed(ctx.channel, ctx.guild, "📅 Monthly 스터디 타임랭킹 📅",
+                             month_start(), now_kst(), COLOR_MONTHLY)
+
+
+@bot.command(name="주간로그")
+async def weekly_log_cmd(ctx):
+    """!주간로그 - 이번 주 기록 Markdown 파일"""
+    now = now_kst()
+    file = build_log_file(markdown_log("🏆 Weekly 스터디 타임랭킹", get_week_start(), now), "weekly", now)
+    await ctx.send("📄 이번 주 로그예요.", file=file)
+
+
+@bot.command(name="월간로그")
+async def monthly_log_cmd(ctx):
+    """!월간로그 - 이번 달 기록 Markdown 파일"""
+    now = now_kst()
+    file = build_log_file(markdown_log("📅 Monthly 스터디 타임랭킹", month_start(), now), "monthly", now)
+    await ctx.send("📄 이번 달 로그예요.", file=file)
+
+
+@bot.command(name="전체로그")
+async def full_log_cmd(ctx):
+    """!전체로그 - 전체 기록 Markdown 파일"""
+    file = build_log_file(markdown_full(), "full", now_kst())
+    await ctx.send("📄 전체 로그예요.", file=file)
 
 
 @bot.command(name="오늘")
@@ -378,9 +429,31 @@ async def today_cmd(ctx):
     await ctx.send(embed=build_leave_embed(ctx.author.display_name, "오늘", today))
 
 
+def _personal_footer(start, now):
+    return f"{start.strftime('%Y.%m.%d %H:%M')} ~ {now.strftime('%m.%d %H:%M')}"
+
+
 @bot.command(name="내주간")
 async def my_week_cmd(ctx):
-    """!내주간 - 내 이번 주 누적/순위 (본인만)"""
+    """!내주간 - 내 이번 주 기록만 (본인만)"""
+    uid = str(ctx.author.id)
+    start, now = get_week_start(), now_kst()
+    cnt = len([s for s in sessions_in_range(start, now) if s["uid"] == uid])
+    if cnt == 0:
+        await ctx.send(f"**{ctx.author.display_name}** 님의 이번 주 기록이 아직 없어요.")
+        return
+    total = personal_total(uid, start, now)
+    embed = discord.Embed(
+        title=f"📊 {ctx.author.display_name} 님의 이번 주 기록",
+        description=f"누적 **{format_duration(total)}** · 총 {cnt}회",
+        color=COLOR_WEEKLY)
+    embed.set_footer(text=_personal_footer(start, now))
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="내순위")
+async def my_rank_cmd(ctx):
+    """!내순위 - 내 이번 주 순위 + 누적 (본인만)"""
     uid = str(ctx.author.id)
     start, now = get_week_start(), now_kst()
     totals = totals_in_range(start, now)
@@ -390,14 +463,12 @@ async def my_week_cmd(ctx):
     ranked = sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True)
     rank = next(i for i, (u, _) in enumerate(ranked, 1) if u == uid)
     medal = MEDALS[rank - 1] if rank <= 3 else ""
-    await ctx.send(
-        f"📊 **{ctx.author.display_name}** 님 이번 주 — **{rank}등**{medal} · "
-        f"누적 **{format_duration(totals[uid]['sec'])}** (총 {len(ranked)}명 중)")
-
-
-@bot.command(name="내순위")
-async def my_rank_cmd(ctx):
-    await my_week_cmd(ctx)
+    embed = discord.Embed(
+        title=f"📊 {ctx.author.display_name} 님의 이번 주 순위",
+        description=f"**{rank}등**{medal} · 누적 **{format_duration(totals[uid]['sec'])}** (총 {len(ranked)}명 중)",
+        color=COLOR_WEEKLY)
+    embed.set_footer(text=_personal_footer(start, now))
+    await ctx.send(embed=embed)
 
 
 # ---- 정모 참석 체크 ----
