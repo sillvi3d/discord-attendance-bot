@@ -303,6 +303,8 @@ async def on_ready():
         weekly_report.start()
     if not monthly_report.is_running():
         monthly_report.start()
+    if not monthly_divider.is_running():
+        monthly_divider.start()
     print(f"봇 시작됨: {bot.user} / 로그 세션 수: {len(sessions_log)}")
 
 
@@ -366,6 +368,23 @@ async def monthly_report():
                                         start, now, COLOR_MONTHLY, "monthly")
 
 
+def month_divider_text(dt):
+    line = "━" * 18
+    return f"{line}\n## 📅  {dt.year}년 {dt.month}월  📅\n{line}"
+
+
+@tasks.loop(minutes=1)
+async def monthly_divider():
+    """매월 1일 00:00에 월 구분선 게시"""
+    now = now_kst()
+    if not (now.day == 1 and now.hour == 0 and now.minute == 0):
+        return
+    for guild in bot.guilds:
+        ch = await get_log_channel(guild)
+        if ch:
+            await ch.send(month_divider_text(now))
+
+
 @weekly_report.before_loop
 async def _b1():
     await bot.wait_until_ready()
@@ -373,6 +392,11 @@ async def _b1():
 
 @monthly_report.before_loop
 async def _b2():
+    await bot.wait_until_ready()
+
+
+@monthly_divider.before_loop
+async def _b3():
     await bot.wait_until_ready()
 
 
@@ -417,6 +441,12 @@ async def full_log_cmd(ctx):
     """!전체로그 - 전체 기록 Markdown 파일"""
     file = build_log_file(markdown_full(), "full", now_kst())
     await ctx.send("📄 전체 로그예요.", file=file)
+
+
+@bot.command(name="구분선")
+async def divider_cmd(ctx):
+    """!구분선 - 이번 달 월 구분선 게시 (수동)"""
+    await ctx.send(month_divider_text(now_kst()))
 
 
 @bot.command(name="오늘")
