@@ -2,23 +2,22 @@
 Discord 스터디 출석 / 타임랭킹 봇
 --------------------------------------------------
 - 지정 음성채널(이름 '포함' 매칭) 입장/퇴장 스탬프 (임베드 카드)
-- 모든 세션을 '영구 로그'로 저장 → 임의 기간(주간·월간) 조회/문서화 가능
-- 자동 발표: 주간 랭킹(매주 수 17:00), 월간 랭킹(매월 말일 21:00)
-- 기간 랭킹은 Markdown 로그 파일로 저장 + 디스코드에 파일로 첨부
-- 정모 참석 체크(✅ 이모지)
+- 모든 세션을 '영구 로그'로 저장 → 임의 기간 조회/문서화 (경계 분할로 정확 집계)
+- 자동 발표:
+    · 아침 07:00  '어제의 스터디 랭킹' (전날 0시~23:59:59)
+    · 매주 수 17:00  주간 랭킹 + 로그 (지난 회의 참석자 포함)
+    · 매월 말일 21:00  월간 랭킹 + 로그
+    · 매월 1일 00:00  월 구분선
+- 회의 참석 체크(✅): 관리자가 !회의체크로 게시 → 참석자 기록 → 로그 저장
 
 명령어:
-  !주간 / !현황   이번 주 전체 타임랭킹 (랭킹만)
-  !월간           이번 달 전체 타임랭킹 (랭킹만)
-  !주간로그        이번 주 기록 Markdown 파일
-  !월간로그        이번 달 기록 Markdown 파일
-  !전체로그        전체 기록 Markdown 파일
-  !오늘           내 오늘 세션 기록
-  !내주간         내 이번 주 기록만 (본인만)
-  !내순위         내 이번 주 순위 + 누적 (본인만)
-  !정모현황       정모 참석 예정자
-  (관리자) !정모체크 · !시간추가 @멤버 분
-※ 자동 발표(주간 수17시 / 월간 말일)에는 로그 파일이 함께 첨부됨.
+  !주간 / !현황   이번 주 전체 타임랭킹
+  !월간           이번 달 전체 타임랭킹
+  !주간로그 / !월간로그 / !전체로그   기록 Markdown 파일
+  !오늘           내 오늘 기록 (본인만)
+  !내주간 / !내순위   내 이번 주 기록·순위 (본인만)
+  !회의현황       오늘 회의 참석자 / !회의로그  회의 참석 이력 파일
+  (관리자) !회의체크 · !시간추가 @멤버 분 · !구분선
 
 실행: pip install discord.py pytz python-dotenv
 """
@@ -39,16 +38,16 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_NAME = "출석체크"    # 스탬프/정산 올릴 텍스트 채널 (이름 '포함' 매칭)
 BOT_NICKNAME = "스터디 봇"       # 서버 표시 별명. None이면 변경 안 함.
 
-VOICE_CHANNEL_IDS = []           # 채널 ID로 지정(권장, 정확). 비우면 아래 이름 '포함' 매칭.
+VOICE_CHANNEL_IDS = []           # 채널 ID로 지정(권장). 비우면 아래 이름 '포함' 매칭.
 VOICE_CHANNEL_NAMES = ["공부방"] # 이름에 이 키워드가 포함된 음성채널 감지 (공부방🔇, 🎧공부방 등)
 
 TIMEZONE = pytz.timezone("Asia/Seoul")
-MIN_ATTENDANCE_MINUTES = 1       # 이 시간(분) 이상이면 '참여 O'
 DATA_FILE = "attendance_data.json"
-LOG_DIR = "logs"                 # 기간 랭킹 Markdown 로그 저장 폴더
+LOG_DIR = "logs"
 
 COLOR_JOIN = 0x57F287
 COLOR_LEAVE = 0x95A5A6
+COLOR_DAILY = 0x5865F2
 COLOR_WEEKLY = 0xFEE75C
 COLOR_MONTHLY = 0xEB459E
 # =============================================
@@ -61,8 +60,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- 상태 ---
 voice_sessions = {}   # {user_id(int): join_time(datetime)}  현재 접속 중
-sessions_log = []     # 영구 세션 로그: [{"uid","name","start","end","dur"}]
-meetup = {"message_id": None, "channel_id": None, "attendees": {}}
+sessions_log = []     # 영구 세션 로그: [{"uid","name","start","end","dur","manual"?}]
+meetup = {"message_id": None, "channel_id": None, "created": None, "attendees": {}}
+meeting_log = []      # 지난 회의 이력: [{"date": iso, "names": [...]}]
 MEETUP_EMOJI = "✅"
 MEDALS = ["🥇", "🥈", "🥉"]
 
@@ -72,8 +72,13 @@ def now_kst():
     return datetime.now(TIMEZONE)
 
 
+def day_start(ref=None):
+    now = ref or now_kst()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def get_week_start(ref=None):
-    """기준 시점의 '현재 주기 시작'(가장 최근 수요일 17:00 <= ref) 반환"""
+    """가장 최근 수요일 17:00 (<= ref)"""
     now = ref or now_kst()
     days_since_wed = (now.weekday() - 2) % 7
     last_wed = (now - timedelta(days=days_since_wed)).replace(hour=17, minute=0, second=0, microsecond=0)
@@ -92,23 +97,28 @@ def is_last_day_of_month(dt):
 
 
 def format_duration(seconds):
+    neg = seconds < 0
+    seconds = abs(seconds)
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     if h > 0:
-        return f"{h}시간 {m}분 {s}초"
-    if m > 0:
-        return f"{m}분 {s}초"
-    return f"{s}초"
+        txt = f"{h}시간 {m}분 {s}초"
+    elif m > 0:
+        txt = f"{m}분 {s}초"
+    else:
+        txt = f"{s}초"
+    return ("-" + txt) if neg else txt
 
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({"sessions": sessions_log, "meetup": meetup}, f, ensure_ascii=False, indent=2)
+        json.dump({"sessions": sessions_log, "meetup": meetup, "meetings": meeting_log},
+                  f, ensure_ascii=False, indent=2)
 
 
 def load_data():
-    global sessions_log, meetup
+    global sessions_log, meetup, meeting_log
     if not os.path.exists(DATA_FILE):
         return
     try:
@@ -116,6 +126,7 @@ def load_data():
             data = json.load(f)
         sessions_log = data.get("sessions", [])
         meetup = data.get("meetup", meetup)
+        meeting_log = data.get("meetings", [])
     except (json.JSONDecodeError, ValueError):
         sessions_log = []
 
@@ -138,74 +149,116 @@ def is_target_channel(channel):
     return any(k in channel.name for k in VOICE_CHANNEL_NAMES)
 
 
-# ==================== 집계 ====================
-def sessions_in_range(start_dt, end_dt):
-    """종료 시각이 [start, end] 안에 든 세션들"""
-    out = []
-    for s in sessions_log:
-        try:
-            end = datetime.fromisoformat(s["end"])
-        except (KeyError, ValueError):
-            continue
-        if start_dt <= end <= end_dt:
-            out.append(s)
-    return out
+# ==================== 집계 (경계 분할) ====================
+def overlap_seconds(s, start_dt, end_dt):
+    """세션이 [start, end] 기간과 실제로 겹치는 시간(초). 수동 보정은 그 시각이 기간 안이면 dur."""
+    try:
+        st = datetime.fromisoformat(s["start"])
+        en = datetime.fromisoformat(s["end"])
+    except (KeyError, ValueError):
+        return 0.0
+    if s.get("manual"):
+        return s["dur"] if start_dt <= en <= end_dt else 0.0
+    lo, hi = max(st, start_dt), min(en, end_dt)
+    return max(0.0, (hi - lo).total_seconds())
 
 
 def totals_in_range(start_dt, end_dt):
-    """기간 내 uid별 누적: {uid: {"name","sec"}}"""
+    """{uid: {"name","sec","cnt"}} — 기간에 겹친 시간만 합산"""
     totals = {}
-    for s in sessions_in_range(start_dt, end_dt):
-        t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0})
-        t["sec"] += s["dur"]
+    for s in sessions_log:
+        ov = overlap_seconds(s, start_dt, end_dt)
+        if ov == 0:
+            continue
+        t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0, "cnt": 0})
+        t["sec"] += ov
+        t["cnt"] += 1
         t["name"] = s["name"]
     return totals
 
 
 def personal_total(uid, start_dt, end_dt):
-    return sum(s["dur"] for s in sessions_in_range(start_dt, end_dt) if s["uid"] == uid)
+    return sum(overlap_seconds(s, start_dt, end_dt) for s in sessions_log if s["uid"] == uid)
 
 
-def personal_sessions_today(uid):
-    start = now_kst().replace(hour=0, minute=0, second=0, microsecond=0)
-    return [s for s in sessions_in_range(start, now_kst()) if s["uid"] == uid]
+def personal_count(uid, start_dt, end_dt):
+    return sum(1 for s in sessions_log if s["uid"] == uid and overlap_seconds(s, start_dt, end_dt) != 0)
+
+
+def personal_today(uid):
+    """오늘(0시~지금) 겹치는 세션들: [(session, 오늘분_초)]"""
+    start, now = day_start(), now_kst()
+    out = []
+    for s in sessions_log:
+        if s["uid"] != uid:
+            continue
+        ov = overlap_seconds(s, start, now)
+        if ov != 0:
+            out.append((s, ov))
+    return out
+
+
+# --- 회의 참석 이력 ---
+def all_meetings():
+    result = list(meeting_log)
+    if meetup.get("created") and meetup.get("attendees"):
+        result.append({"date": meetup["created"], "names": list(meetup["attendees"].values())})
+    return result
+
+
+def meeting_names_in_range(start_dt, end_dt):
+    names, seen = [], set()
+    for mt in all_meetings():
+        try:
+            d = datetime.fromisoformat(mt["date"])
+        except (KeyError, ValueError):
+            continue
+        if start_dt <= d <= end_dt:
+            for n in mt.get("names", []):
+                if n not in seen:
+                    seen.add(n)
+                    names.append(n)
+    return names
 
 
 # ==================== 임베드/문서 ====================
-def build_ranking_embed(guild, title, start_dt, end_dt, color):
+def build_ranking_embed(guild, title, start_dt, end_dt, color, show_meeting=True):
     period = f"{start_dt.strftime('%Y.%m.%d %H:%M')} ~ {end_dt.strftime('%m.%d %H:%M')}"
     embed = discord.Embed(title=title, color=color)
     embed.set_footer(text=period)
     totals = totals_in_range(start_dt, end_dt)
-    if not totals:
+    if totals:
+        ranked = sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True)
+        lines, rest = [], []
+        for i, (uid, d) in enumerate(ranked, 1):
+            row = f"<@{uid}> — {format_duration(d['sec'])}"
+            if i <= 3:
+                lines.append(f"{i}등{MEDALS[i-1]} : {row}")
+            else:
+                rest.append(f"· {row}")
+        body = "\n".join(lines)
+        if rest:
+            body += "\n-\n" + "\n".join(rest)
+        embed.description = body
+    else:
         embed.description = "이 기간엔 기록이 없어요."
-        return embed
-    ranked = sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True)
-    lines, rest = [], []
-    for i, (uid, d) in enumerate(ranked, 1):
-        row = f"<@{uid}> — {format_duration(d['sec'])}"
-        if i <= 3:
-            lines.append(f"{i}등{MEDALS[i-1]} : {row}")
-        else:
-            rest.append(f"· {row}")
-    body = "\n".join(lines)
-    if rest:
-        body += "\n-\n" + "\n".join(rest)
-    embed.description = body
-    meetup_att = meetup.get("attendees", {})
-    if meetup_att:
-        embed.add_field(name=f"📢 정모 참석 예정 ({len(meetup_att)}명)",
-                        value=", ".join(meetup_att.values()), inline=False)
+    if show_meeting:
+        names = meeting_names_in_range(start_dt, end_dt)
+        embed.add_field(name=f"🏛️ 지난 회의 참석자 ({len(names)}명)",
+                        value=", ".join(names) if names else "없음", inline=False)
     return embed
 
 
 def build_leave_embed(name, channel_name, today_sessions):
-    total = sum(s["dur"] for s in today_sessions)
-    lines = [
-        f"입장 {datetime.fromisoformat(s['start']).strftime('%H:%M:%S')} → "
-        f"퇴장 {datetime.fromisoformat(s['end']).strftime('%H:%M:%S')} · 머문 시간 **{format_duration(s['dur'])}**"
-        for s in today_sessions
-    ]
+    total = sum(ov for _, ov in today_sessions)
+    lines = []
+    for s, ov in today_sessions:
+        if s.get("manual"):
+            lines.append(f"보정 · **{format_duration(ov)}**")
+        else:
+            st = datetime.fromisoformat(s["start"]).strftime("%H:%M:%S")
+            en = datetime.fromisoformat(s["end"]).strftime("%H:%M:%S")
+            lines.append(f"입장 {st} → 퇴장 {en} · 머문 시간 **{format_duration(ov)}**")
     desc = "\n".join(lines) + f"\n\n오늘 누적: **{format_duration(total)}** (총 {len(today_sessions)}회)"
     embed = discord.Embed(title=f"🔴 퇴장 · {name}", description=desc, color=COLOR_LEAVE)
     embed.set_footer(text=f"채널: {channel_name}")
@@ -213,35 +266,28 @@ def build_leave_embed(name, channel_name, today_sessions):
 
 
 def markdown_log(title, start_dt, end_dt):
-    """기간 랭킹을 Markdown 문서 문자열로"""
     totals = totals_in_range(start_dt, end_dt)
     ranked = sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True)
-    lines = [
-        f"# {title}",
-        f"기간: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}",
-        "",
-        "| 순위 | 이름 | 누적 시간 | 세션 수 |",
-        "|---|---|---|---|",
-    ]
-    counts = {}
-    for s in sessions_in_range(start_dt, end_dt):
-        counts[s["uid"]] = counts.get(s["uid"], 0) + 1
+    lines = [f"# {title}",
+             f"기간: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}",
+             "", "| 순위 | 이름 | 누적 시간 | 세션 수 |", "|---|---|---|---|"]
     for i, (uid, d) in enumerate(ranked, 1):
-        lines.append(f"| {i} | {d['name']} | {format_duration(d['sec'])} | {counts.get(uid, 0)} |")
+        lines.append(f"| {i} | {d['name']} | {format_duration(d['sec'])} | {d['cnt']} |")
     if not ranked:
         lines.append("| - | 기록 없음 | - | - |")
+    names = meeting_names_in_range(start_dt, end_dt)
+    lines += ["", "## 회의 참석자", "", (", ".join(names) if names else "없음")]
     return "\n".join(lines) + "\n"
 
 
 def markdown_full():
-    """전체 기간 누적 랭킹 + 모든 세션 목록"""
     lines = ["# 전체 스터디 로그",
              f"생성: {now_kst().strftime('%Y-%m-%d %H:%M')}",
              f"총 세션 수: {len(sessions_log)}", ""]
     totals = {}
     for s in sessions_log:
         t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0})
-        t["sec"] += s["dur"]
+        t["sec"] += s.get("dur", 0)
         t["name"] = s["name"]
     lines += ["## 전체 누적 랭킹", "", "| 순위 | 이름 | 누적 시간 |", "|---|---|---|"]
     for i, (uid, d) in enumerate(sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True), 1):
@@ -253,13 +299,20 @@ def markdown_full():
             en = datetime.fromisoformat(s["end"])
         except (KeyError, ValueError):
             continue
-        lines.append(f"| {en.strftime('%Y-%m-%d')} | {s['name']} | "
-                     f"{st.strftime('%H:%M:%S')} | {en.strftime('%H:%M:%S')} | {format_duration(s['dur'])} |")
+        tag = "보정" if s.get("manual") else ""
+        lines.append(f"| {en.strftime('%Y-%m-%d')} | {s['name']}{tag} | "
+                     f"{st.strftime('%H:%M:%S')} | {en.strftime('%H:%M:%S')} | {format_duration(s.get('dur', 0))} |")
+    lines += ["", "## 회의 참석 이력", ""]
+    for mt in sorted(all_meetings(), key=lambda x: x.get("date", "")):
+        try:
+            d = datetime.fromisoformat(mt["date"]).strftime("%Y-%m-%d")
+        except (KeyError, ValueError):
+            d = "?"
+        lines.append(f"- {d} ({len(mt.get('names', []))}명): {', '.join(mt.get('names', [])) or '없음'}")
     return "\n".join(lines) + "\n"
 
 
 def build_log_file(md_text, tag, end_dt):
-    """Markdown을 logs/에 저장하고 discord.File 반환"""
     fname = f"{tag}_{end_dt.strftime('%Y-%m-%d')}.md"
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -271,12 +324,10 @@ def build_log_file(md_text, tag, end_dt):
 
 
 async def send_ranking_embed(channel, guild, title, start_dt, end_dt, color):
-    """랭킹 임베드만 전송 (로그 파일 없음)"""
     await channel.send(embed=build_ranking_embed(guild, title, start_dt, end_dt, color))
 
 
 async def send_ranking_with_log(channel, guild, title, start_dt, end_dt, color, tag):
-    """임베드 + 로그 파일 함께 (자동 발표용)"""
     embed = build_ranking_embed(guild, title, start_dt, end_dt, color)
     file = build_log_file(markdown_log(title, start_dt, end_dt), tag, end_dt)
     await channel.send(embed=embed, file=file)
@@ -299,12 +350,9 @@ async def on_ready():
                 for m in vc.members:
                     if not m.bot:
                         voice_sessions[m.id] = now
-    if not weekly_report.is_running():
-        weekly_report.start()
-    if not monthly_report.is_running():
-        monthly_report.start()
-    if not monthly_divider.is_running():
-        monthly_divider.start()
+    for loop in (daily_report, weekly_report, monthly_report, monthly_divider):
+        if not loop.is_running():
+            loop.start()
     print(f"봇 시작됨: {bot.user} / 로그 세션 수: {len(sessions_log)}")
 
 
@@ -318,9 +366,9 @@ async def on_voice_state_update(member, before, after):
 
     if not before_t and after_t:  # 입장
         voice_sessions[member.id] = now
-        log_channel = await get_log_channel(member.guild)
-        if log_channel:
-            await log_channel.send(embed=discord.Embed(
+        ch = await get_log_channel(member.guild)
+        if ch:
+            await ch.send(embed=discord.Embed(
                 title=f"🟢 입장 · {member.display_name}",
                 description=f"`{after.channel.name}` 에 들어왔어요 · {now.strftime('%H:%M:%S')}",
                 color=COLOR_JOIN))
@@ -329,19 +377,36 @@ async def on_voice_state_update(member, before, after):
         if member.id not in voice_sessions:
             return
         join = voice_sessions.pop(member.id)
-        dur = (now - join).total_seconds()
         sessions_log.append({
             "uid": str(member.id), "name": member.display_name,
-            "start": join.isoformat(), "end": now.isoformat(), "dur": dur,
+            "start": join.isoformat(), "end": now.isoformat(),
+            "dur": (now - join).total_seconds(),
         })
         save_data()
-        log_channel = await get_log_channel(member.guild)
-        if log_channel:
-            today = personal_sessions_today(str(member.id))
-            await log_channel.send(embed=build_leave_embed(member.display_name, before.channel.name, today))
+        ch = await get_log_channel(member.guild)
+        if ch:
+            await ch.send(embed=build_leave_embed(member.display_name, before.channel.name,
+                                                  personal_today(str(member.id))))
 
 
 # ==================== 자동 발표 ====================
+@tasks.loop(minutes=1)
+async def daily_report():
+    """매일 07:00 — 어제(0시~23:59:59) 스터디 랭킹"""
+    now = now_kst()
+    if not (now.hour == 7 and now.minute == 0):
+        return
+    today0 = day_start(now)
+    y_start = today0 - timedelta(days=1)
+    y_end = today0 - timedelta(seconds=1)
+    for guild in bot.guilds:
+        ch = await get_log_channel(guild)
+        if ch:
+            embed = build_ranking_embed(guild, "☀️ 어제의 스터디 랭킹 — 어제 가장 많이 공부한 사람은?",
+                                        y_start, y_end, COLOR_DAILY, show_meeting=False)
+            await ch.send(embed=embed)
+
+
 @tasks.loop(minutes=1)
 async def weekly_report():
     now = now_kst()
@@ -360,12 +425,11 @@ async def monthly_report():
     now = now_kst()
     if not (is_last_day_of_month(now) and now.hour == 21 and now.minute == 0):
         return
-    start = month_start(now)
     for guild in bot.guilds:
         ch = await get_log_channel(guild)
         if ch:
             await send_ranking_with_log(ch, guild, "📅 Monthly 스터디 타임랭킹 📅",
-                                        start, now, COLOR_MONTHLY, "monthly")
+                                        month_start(now), now, COLOR_MONTHLY, "monthly")
 
 
 def month_divider_text(dt):
@@ -375,7 +439,6 @@ def month_divider_text(dt):
 
 @tasks.loop(minutes=1)
 async def monthly_divider():
-    """매월 1일 00:00에 월 구분선 게시"""
     now = now_kst()
     if not (now.day == 1 and now.hour == 0 and now.minute == 0):
         return
@@ -385,25 +448,30 @@ async def monthly_divider():
             await ch.send(month_divider_text(now))
 
 
+@daily_report.before_loop
+async def _bd():
+    await bot.wait_until_ready()
+
+
 @weekly_report.before_loop
-async def _b1():
+async def _bw():
     await bot.wait_until_ready()
 
 
 @monthly_report.before_loop
-async def _b2():
+async def _bm():
     await bot.wait_until_ready()
 
 
 @monthly_divider.before_loop
-async def _b3():
+async def _bv():
     await bot.wait_until_ready()
 
 
 # ==================== 명령어 ====================
 @bot.command(name="주간")
 async def weekly_cmd(ctx):
-    """!주간 - 이번 주 전체 타임랭킹 (랭킹만)"""
+    """!주간 - 이번 주 전체 타임랭킹"""
     await send_ranking_embed(ctx.channel, ctx.guild, "🏆 Weekly 스터디 타임랭킹 🏆",
                              get_week_start(), now_kst(), COLOR_WEEKLY)
 
@@ -415,14 +483,13 @@ async def status_cmd(ctx):
 
 @bot.command(name="월간")
 async def monthly_cmd(ctx):
-    """!월간 - 이번 달 전체 타임랭킹 (랭킹만)"""
+    """!월간 - 이번 달 전체 타임랭킹"""
     await send_ranking_embed(ctx.channel, ctx.guild, "📅 Monthly 스터디 타임랭킹 📅",
                              month_start(), now_kst(), COLOR_MONTHLY)
 
 
 @bot.command(name="주간로그")
 async def weekly_log_cmd(ctx):
-    """!주간로그 - 이번 주 기록 Markdown 파일"""
     now = now_kst()
     file = build_log_file(markdown_log("🏆 Weekly 스터디 타임랭킹", get_week_start(), now), "weekly", now)
     await ctx.send("📄 이번 주 로그예요.", file=file)
@@ -430,7 +497,6 @@ async def weekly_log_cmd(ctx):
 
 @bot.command(name="월간로그")
 async def monthly_log_cmd(ctx):
-    """!월간로그 - 이번 달 기록 Markdown 파일"""
     now = now_kst()
     file = build_log_file(markdown_log("📅 Monthly 스터디 타임랭킹", month_start(), now), "monthly", now)
     await ctx.send("📄 이번 달 로그예요.", file=file)
@@ -438,28 +504,42 @@ async def monthly_log_cmd(ctx):
 
 @bot.command(name="전체로그")
 async def full_log_cmd(ctx):
-    """!전체로그 - 전체 기록 Markdown 파일"""
     file = build_log_file(markdown_full(), "full", now_kst())
     await ctx.send("📄 전체 로그예요.", file=file)
 
 
+@bot.command(name="회의로그")
+async def meeting_log_cmd(ctx):
+    lines = ["# 회의 참석 이력", ""]
+    mts = sorted(all_meetings(), key=lambda x: x.get("date", ""))
+    if not mts:
+        lines.append("기록 없음")
+    for mt in mts:
+        try:
+            d = datetime.fromisoformat(mt["date"]).strftime("%Y-%m-%d")
+        except (KeyError, ValueError):
+            d = "?"
+        lines.append(f"- **{d}** ({len(mt.get('names', []))}명): {', '.join(mt.get('names', [])) or '없음'}")
+    file = build_log_file("\n".join(lines) + "\n", "meetings", now_kst())
+    await ctx.send("📄 회의 참석 이력이에요.", file=file)
+
+
 @bot.command(name="구분선")
 async def divider_cmd(ctx):
-    """!구분선 - 이번 달 월 구분선 게시 (수동)"""
     await ctx.send(month_divider_text(now_kst()))
 
 
 @bot.command(name="오늘")
 async def today_cmd(ctx):
-    """!오늘 - 내 오늘 세션 기록 (본인만)"""
-    today = personal_sessions_today(str(ctx.author.id))
+    """!오늘 - 내 오늘 기록 (본인만)"""
+    today = personal_today(str(ctx.author.id))
     if not today:
         await ctx.send(f"**{ctx.author.display_name}** 님의 오늘 기록이 아직 없어요.")
         return
     await ctx.send(embed=build_leave_embed(ctx.author.display_name, "오늘", today))
 
 
-def _personal_footer(start, now):
+def _pfooter(start, now):
     return f"{start.strftime('%Y.%m.%d %H:%M')} ~ {now.strftime('%m.%d %H:%M')}"
 
 
@@ -468,16 +548,15 @@ async def my_week_cmd(ctx):
     """!내주간 - 내 이번 주 기록만 (본인만)"""
     uid = str(ctx.author.id)
     start, now = get_week_start(), now_kst()
-    cnt = len([s for s in sessions_in_range(start, now) if s["uid"] == uid])
+    cnt = personal_count(uid, start, now)
     if cnt == 0:
         await ctx.send(f"**{ctx.author.display_name}** 님의 이번 주 기록이 아직 없어요.")
         return
-    total = personal_total(uid, start, now)
     embed = discord.Embed(
         title=f"📊 {ctx.author.display_name} 님의 이번 주 기록",
-        description=f"누적 **{format_duration(total)}** · 총 {cnt}회",
+        description=f"누적 **{format_duration(personal_total(uid, start, now))}** · 총 {cnt}회",
         color=COLOR_WEEKLY)
-    embed.set_footer(text=_personal_footer(start, now))
+    embed.set_footer(text=_pfooter(start, now))
     await ctx.send(embed=embed)
 
 
@@ -497,29 +576,33 @@ async def my_rank_cmd(ctx):
         title=f"📊 {ctx.author.display_name} 님의 이번 주 순위",
         description=f"**{rank}등**{medal} · 누적 **{format_duration(totals[uid]['sec'])}** (총 {len(ranked)}명 중)",
         color=COLOR_WEEKLY)
-    embed.set_footer(text=_personal_footer(start, now))
+    embed.set_footer(text=_pfooter(start, now))
     await ctx.send(embed=embed)
 
 
-# ---- 정모 참석 체크 ----
-@bot.command(name="정모체크")
+# ---- 회의 참석 체크 ----
+@bot.command(name="회의체크", aliases=["정모체크"])
 @commands.has_permissions(manage_guild=True)
-async def meetup_check_cmd(ctx):
-    msg = await ctx.send("📢 **이번 주 정모 참석 체크**\n참석하시는 분은 아래 ✅ 를 눌러주세요!")
+async def meeting_check_cmd(ctx):
+    """!회의체크 - 오늘 회의 참석 체크 게시 (관리자)"""
+    if meetup.get("created") and meetup.get("attendees"):
+        meeting_log.append({"date": meetup["created"], "names": list(meetup["attendees"].values())})
+    msg = await ctx.send("🏛️ **오늘 회의 참석 체크**\n오늘 회의에 참석하신 분은 아래 ✅ 를 눌러주세요!")
     await msg.add_reaction(MEETUP_EMOJI)
     meetup["message_id"] = msg.id
     meetup["channel_id"] = msg.channel.id
+    meetup["created"] = now_kst().isoformat()
     meetup["attendees"] = {}
     save_data()
 
 
-@bot.command(name="정모현황")
-async def meetup_status_cmd(ctx):
+@bot.command(name="회의현황", aliases=["정모현황"])
+async def meeting_status_cmd(ctx):
     att = meetup.get("attendees", {})
     if not att:
-        await ctx.send("아직 정모 참석 체크가 없어요. 관리자가 `!정모체크` 로 시작할 수 있어요.")
+        await ctx.send("아직 회의 참석 체크가 없어요. 관리자가 `!회의체크` 로 시작할 수 있어요.")
         return
-    await ctx.send(f"📢 **정모 참석 예정** ({len(att)}명): {', '.join(att.values())}")
+    await ctx.send(f"🏛️ **오늘 회의 참석** ({len(att)}명): {', '.join(att.values())}")
 
 
 @bot.command(name="시간추가")
@@ -529,10 +612,11 @@ async def add_time_cmd(ctx, member: discord.Member, minutes: int):
     now = now_kst()
     sessions_log.append({
         "uid": str(member.id), "name": member.display_name,
-        "start": now.isoformat(), "end": now.isoformat(), "dur": minutes * 60,
+        "start": now.isoformat(), "end": now.isoformat(),
+        "dur": minutes * 60, "manual": True,
     })
     save_data()
-    await ctx.send(f"✏️ **{member.display_name}** 님 기록에 {minutes:+d}분 보정 세션을 추가했어요.")
+    await ctx.send(f"✏️ **{member.display_name}** 님 기록에 {minutes:+d}분 보정을 추가했어요.")
 
 
 @bot.event
