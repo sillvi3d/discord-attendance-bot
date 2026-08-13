@@ -222,6 +222,15 @@ def meeting_names_in_range(start_dt, end_dt):
 
 
 # ==================== 임베드/문서 ====================
+def display_name_of(guild, uid, fallback):
+    """서버 별명(스터디방 이름)을 우선 반환. 모바일에서도 별명이 정확히 뜨도록 멘션 대신 사용."""
+    try:
+        m = guild.get_member(int(uid)) if guild else None
+    except (ValueError, AttributeError):
+        m = None
+    return m.display_name if m else fallback
+
+
 def build_ranking_embed(guild, title, start_dt, end_dt, color, show_meeting=True):
     period = f"{start_dt.strftime('%Y.%m.%d %H:%M')} ~ {end_dt.strftime('%m.%d %H:%M')}"
     embed = discord.Embed(title=title, color=color)
@@ -231,7 +240,7 @@ def build_ranking_embed(guild, title, start_dt, end_dt, color, show_meeting=True
         ranked = sorted(totals.items(), key=lambda x: x[1]["sec"], reverse=True)
         lines, rest = [], []
         for i, (uid, d) in enumerate(ranked, 1):
-            row = f"<@{uid}> — {format_duration(d['sec'])}"
+            row = f"**{display_name_of(guild, uid, d['name'])}** — {format_duration(d['sec'])}"
             if i <= 3:
                 lines.append(f"{i}등{MEDALS[i-1]} : {row}")
             else:
