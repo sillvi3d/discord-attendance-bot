@@ -149,47 +149,56 @@ def is_target_channel(channel):
     return any(k in channel.name for k in VOICE_CHANNEL_NAMES)
 
 
-# ============ 집계 (세션은 '퇴장 시각' 기준, 전체 시간으로 집계) ============
-def session_end(s):
+# ============ 집계 ============
+# · 기간 랭킹(일/주/월): 해당 기간에 '실제로 걸친 시간'만 합산 (경계에서 분할)
+# · 퇴장 카드/!오늘: 세션별 '머문 시간'은 전체를 보여주되, '오늘 누적'은 오늘 몫만 합산
+def overlap_seconds(s, start_dt, end_dt):
+    """세션이 [start, end]와 실제로 겹치는 시간(초). 수동 보정은 그 시각이 기간 안이면 dur."""
     try:
-        return datetime.fromisoformat(s["end"])
+        st = datetime.fromisoformat(s["start"])
+        en = datetime.fromisoformat(s["end"])
     except (KeyError, ValueError):
-        return None
-
-
-def in_period(s, start_dt, end_dt):
-    """세션의 '퇴장 시각'이 기간 안이면 그 기간으로 집계 (자정/주경계 걸쳐도 전체 시간 유지)"""
-    en = session_end(s)
-    return en is not None and start_dt <= en <= end_dt
+        return 0.0
+    if s.get("manual"):
+        return s["dur"] if start_dt <= en <= end_dt else 0.0
+    lo, hi = max(st, start_dt), min(en, end_dt)
+    return max(0.0, (hi - lo).total_seconds())
 
 
 def totals_in_range(start_dt, end_dt):
-    """{uid: {"name","sec","cnt"}} — 퇴장 시각이 기간 안인 세션의 '전체 시간' 합산"""
+    """{uid: {"name","sec","cnt"}} — 기간에 겹친 시간만 합산"""
     totals = {}
     for s in sessions_log:
-        if not in_period(s, start_dt, end_dt):
+        ov = overlap_seconds(s, start_dt, end_dt)
+        if ov == 0:
             continue
         t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0, "cnt": 0})
-        t["sec"] += s.get("dur", 0)
+        t["sec"] += ov
         t["cnt"] += 1
         t["name"] = s["name"]
     return totals
 
 
 def personal_total(uid, start_dt, end_dt):
-    return sum(s.get("dur", 0) for s in sessions_log
-              if s["uid"] == uid and in_period(s, start_dt, end_dt))
+    return sum(overlap_seconds(s, start_dt, end_dt) for s in sessions_log if s["uid"] == uid)
 
 
 def personal_count(uid, start_dt, end_dt):
-    return sum(1 for s in sessions_log if s["uid"] == uid and in_period(s, start_dt, end_dt))
+    return sum(1 for s in sessions_log if s["uid"] == uid and overlap_seconds(s, start_dt, end_dt) != 0)
 
 
 def personal_today(uid):
-    """오늘(0시~지금) 퇴장한 세션들: [(session, 전체시간_초)]"""
+    """오늘 겹치는 세션들: [(session, 전체_머문시간, 오늘_몫)]"""
     start, now = day_start(), now_kst()
-    return [(s, s.get("dur", 0)) for s in sessions_log
-            if s["uid"] == uid and in_period(s, start, now)]
+    out = []
+    for s in sessions_log:
+        if s["uid"] != uid:
+            continue
+        ov = overlap_seconds(s, start, now)
+        if ov == 0:
+            continue
+        out.append((s, s.get("dur", 0), ov))
+    return out
 
 
 # --- 회의 참석 이력 ---
@@ -253,16 +262,16 @@ def build_ranking_embed(guild, title, start_dt, end_dt, color, show_meeting=True
 
 
 def build_leave_embed(name, channel_name, today_sessions):
-    total = sum(ov for _, ov in today_sessions)
+    today_total = sum(ov for _, _, ov in today_sessions)   # 오늘 누적 = 오늘 몫만
     lines = []
-    for s, ov in today_sessions:
+    for s, full, ov in today_sessions:
         if s.get("manual"):
-            lines.append(f"보정 · **{format_duration(ov)}**")
+            lines.append(f"보정 · **{format_duration(full)}**")
         else:
             st = datetime.fromisoformat(s["start"]).strftime("%H:%M:%S")
             en = datetime.fromisoformat(s["end"]).strftime("%H:%M:%S")
-            lines.append(f"입장 {st} → 퇴장 {en} · 머문 시간 **{format_duration(ov)}**")
-    desc = "\n".join(lines) + f"\n\n오늘 누적: **{format_duration(total)}** (총 {len(today_sessions)}회)"
+            lines.append(f"입장 {st} → 퇴장 {en} · 머문 시간 **{format_duration(full)}**")  # 세션 전체 시간
+    desc = "\n".join(lines) + f"\n\n오늘 누적: **{format_duration(today_total)}** (총 {len(today_sessions)}회)"
     embed = discord.Embed(title=f"🔴 퇴장 · {name}", description=desc, color=COLOR_LEAVE)
     embed.set_footer(text=f"채널: {channel_name}")
     return embed
