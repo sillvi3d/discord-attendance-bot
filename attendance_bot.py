@@ -2,7 +2,7 @@
 Discord 스터디 출석 / 타임랭킹 봇
 --------------------------------------------------
 - 지정 음성채널(이름 '포함' 매칭) 입장/퇴장 스탬프 (임베드 카드)
-- 모든 세션을 '영구 로그'로 저장 → 임의 기간 조회/문서화 (경계 분할로 정확 집계)
+- 모든 세션을 '영구 로그'로 저장 → 임의 기간 조회/문서화 (세션은 '퇴장 시각' 기준, 전체 시간 집계)
 - 자동 발표:
     · 아침 07:00  '어제의 스터디 랭킹' (전날 0시~23:59:59)
     · 매주 수 17:00  주간 랭킹 + 로그 (지난 회의 참석자 포함)
@@ -149,53 +149,47 @@ def is_target_channel(channel):
     return any(k in channel.name for k in VOICE_CHANNEL_NAMES)
 
 
-# ==================== 집계 (경계 분할) ====================
-def overlap_seconds(s, start_dt, end_dt):
-    """세션이 [start, end] 기간과 실제로 겹치는 시간(초). 수동 보정은 그 시각이 기간 안이면 dur."""
+# ============ 집계 (세션은 '퇴장 시각' 기준, 전체 시간으로 집계) ============
+def session_end(s):
     try:
-        st = datetime.fromisoformat(s["start"])
-        en = datetime.fromisoformat(s["end"])
+        return datetime.fromisoformat(s["end"])
     except (KeyError, ValueError):
-        return 0.0
-    if s.get("manual"):
-        return s["dur"] if start_dt <= en <= end_dt else 0.0
-    lo, hi = max(st, start_dt), min(en, end_dt)
-    return max(0.0, (hi - lo).total_seconds())
+        return None
+
+
+def in_period(s, start_dt, end_dt):
+    """세션의 '퇴장 시각'이 기간 안이면 그 기간으로 집계 (자정/주경계 걸쳐도 전체 시간 유지)"""
+    en = session_end(s)
+    return en is not None and start_dt <= en <= end_dt
 
 
 def totals_in_range(start_dt, end_dt):
-    """{uid: {"name","sec","cnt"}} — 기간에 겹친 시간만 합산"""
+    """{uid: {"name","sec","cnt"}} — 퇴장 시각이 기간 안인 세션의 '전체 시간' 합산"""
     totals = {}
     for s in sessions_log:
-        ov = overlap_seconds(s, start_dt, end_dt)
-        if ov == 0:
+        if not in_period(s, start_dt, end_dt):
             continue
         t = totals.setdefault(s["uid"], {"name": s["name"], "sec": 0.0, "cnt": 0})
-        t["sec"] += ov
+        t["sec"] += s.get("dur", 0)
         t["cnt"] += 1
         t["name"] = s["name"]
     return totals
 
 
 def personal_total(uid, start_dt, end_dt):
-    return sum(overlap_seconds(s, start_dt, end_dt) for s in sessions_log if s["uid"] == uid)
+    return sum(s.get("dur", 0) for s in sessions_log
+              if s["uid"] == uid and in_period(s, start_dt, end_dt))
 
 
 def personal_count(uid, start_dt, end_dt):
-    return sum(1 for s in sessions_log if s["uid"] == uid and overlap_seconds(s, start_dt, end_dt) != 0)
+    return sum(1 for s in sessions_log if s["uid"] == uid and in_period(s, start_dt, end_dt))
 
 
 def personal_today(uid):
-    """오늘(0시~지금) 겹치는 세션들: [(session, 오늘분_초)]"""
+    """오늘(0시~지금) 퇴장한 세션들: [(session, 전체시간_초)]"""
     start, now = day_start(), now_kst()
-    out = []
-    for s in sessions_log:
-        if s["uid"] != uid:
-            continue
-        ov = overlap_seconds(s, start, now)
-        if ov != 0:
-            out.append((s, ov))
-    return out
+    return [(s, s.get("dur", 0)) for s in sessions_log
+            if s["uid"] == uid and in_period(s, start, now)]
 
 
 # --- 회의 참석 이력 ---
